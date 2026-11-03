@@ -496,6 +496,9 @@ pub trait Handler {
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
 
+    /// Semantic prompt zone finished; the command's exit code (OSC 133;D).
+    fn semantic_prompt_exit(&mut self, _exit_code: u32) {}
+
     /// Set the cursor style.
     fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
 
@@ -1520,6 +1523,18 @@ where
             // Reset text cursor color.
             b"112" => self.handler.reset_color(NamedColor::Cursor as usize),
 
+            // Semantic prompt finished; the parameter is the command's exit code.
+            //
+            // FinalTerm/contour shell integration. Only the `D` (finish) marker with a
+            // trailing exit code parameter is consumed; every other marker or payload
+            // falls through to `unhandled`.
+            b"133" if params.len() == 3 && params[1] == b"D" => {
+                match parse_number(params[2]) {
+                    Some(exit_code) => self.handler.semantic_prompt_exit(exit_code as u32),
+                    None => unhandled(params),
+                }
+            },
+
             _ => unhandled(params),
         }
     }
@@ -2046,6 +2061,7 @@ mod tests {
         identity_reported: bool,
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
+        prompt_exit: Option<u32>,
     }
 
     impl Handler for MockHandler {
@@ -2074,6 +2090,10 @@ mod tests {
             self.color = Some(c);
         }
 
+        fn semantic_prompt_exit(&mut self, exit_code: u32) {
+            self.prompt_exit = Some(exit_code);
+        }
+
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
@@ -2088,6 +2108,7 @@ mod tests {
                 identity_reported: false,
                 color: None,
                 reset_colors: Vec::new(),
+                prompt_exit: None,
             }
         }
     }
@@ -2315,6 +2336,66 @@ mod tests {
 
         let expected: Vec<usize> = (0..256).collect();
         assert_eq!(handler.reset_colors, expected);
+    }
+
+    #[test]
+    fn parse_osc133_prompt_exit() {
+        let bytes: &[u8] = b"\x1b]133;D;1\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.prompt_exit, Some(1));
+    }
+
+    #[test]
+    fn parse_osc133_prompt_exit_st_terminated_zero() {
+        let bytes: &[u8] = b"\x1b]133;D;0\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.prompt_exit, Some(0));
+    }
+
+    #[test]
+    fn parse_osc133_prompt_start_unhandled() {
+        let bytes: &[u8] = b"\x1b]133;A\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.prompt_exit, None);
+    }
+
+    #[test]
+    fn parse_osc133_prompt_exit_without_code_unhandled() {
+        let bytes: &[u8] = b"\x1b]133;D\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.prompt_exit, None);
+    }
+
+    #[test]
+    fn parse_osc133_prompt_exit_non_numeric_code_unhandled() {
+        let bytes: &[u8] = b"\x1b]133;D;err\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.prompt_exit, None);
     }
 
     #[test]
