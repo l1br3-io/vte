@@ -499,6 +499,10 @@ pub trait Handler {
     /// Semantic prompt zone finished; the command's exit code (OSC 133;D).
     fn semantic_prompt_exit(&mut self, _exit_code: u32) {}
 
+    /// Current working directory reported by the shell (OSC 7); the
+    /// `file://` URL exactly as the emitter wrote it.
+    fn current_directory(&mut self, _url: String) {}
+
     /// Set the cursor style.
     fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
 
@@ -1535,6 +1539,22 @@ where
                 }
             },
 
+            // Current working directory report; the parameter is a `file://` URL.
+            //
+            // Shell integration (WezTerm/iTerm2/VTE semantics): the shell reports
+            // its own cwd — including remote hosts over SSH. Semicolons inside the
+            // URL split it across parameters; they are rejoined verbatim, as the
+            // OSC 8 hyperlink arm does. An empty payload falls through to
+            // `unhandled`.
+            b"7" if params.len() >= 2 && !params[1].is_empty() => {
+                let mut url = String::from_utf8_lossy(params[1]).into_owned();
+                for param in &params[2..] {
+                    url.push(';');
+                    url.push_str(&String::from_utf8_lossy(param));
+                }
+                self.handler.current_directory(url);
+            },
+
             _ => unhandled(params),
         }
     }
@@ -2062,6 +2082,7 @@ mod tests {
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
         prompt_exit: Option<u32>,
+        current_directory: Option<String>,
     }
 
     impl Handler for MockHandler {
@@ -2094,6 +2115,10 @@ mod tests {
             self.prompt_exit = Some(exit_code);
         }
 
+        fn current_directory(&mut self, url: String) {
+            self.current_directory = Some(url);
+        }
+
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
@@ -2109,6 +2134,7 @@ mod tests {
                 color: None,
                 reset_colors: Vec::new(),
                 prompt_exit: None,
+                current_directory: None,
             }
         }
     }
@@ -2360,6 +2386,54 @@ mod tests {
         parser.advance(&mut handler, bytes);
 
         assert_eq!(handler.prompt_exit, Some(0));
+    }
+
+    #[test]
+    fn parse_osc7_current_directory() {
+        let bytes: &[u8] = b"\x1b]7;file://host/home/user\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.current_directory, Some("file://host/home/user".to_owned()));
+    }
+
+    #[test]
+    fn parse_osc7_current_directory_st_terminated() {
+        let bytes: &[u8] = b"\x1b]7;file://localhost/tmp\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.current_directory, Some("file://localhost/tmp".to_owned()));
+    }
+
+    #[test]
+    fn parse_osc7_semicolon_path_rejoined() {
+        let bytes: &[u8] = b"\x1b]7;file://host/home/a;b\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.current_directory, Some("file://host/home/a;b".to_owned()));
+    }
+
+    #[test]
+    fn parse_osc7_empty_unhandled() {
+        let bytes: &[u8] = b"\x1b]7;\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.current_directory, None);
     }
 
     #[test]
