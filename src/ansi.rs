@@ -503,6 +503,12 @@ pub trait Handler {
     /// `file://` URL exactly as the emitter wrote it.
     fn current_directory(&mut self, _url: String) {}
 
+    /// Progress report from the running command (OSC 9;4); the state
+    /// (0 remove, 1 in progress, 2 error, 3 indeterminate, 4 paused) and
+    /// the optional percent value 0–100, omitted when the consumer's
+    /// standing value should stay unchanged.
+    fn progress_report(&mut self, _state: u8, _value: Option<u8>) {}
+
     /// Set the cursor style.
     fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
 
@@ -1555,6 +1561,30 @@ where
                 self.handler.current_directory(url);
             },
 
+            // Progress report; the parameters are a state integer and an
+            // optional percent (ConEmu-family shell integration).
+            //
+            // ConEmu/Windows Terminal/kitty/Ghostty semantics: state 0 removes
+            // the report, 1 in progress, 2 error, 3 indeterminate, 4 paused;
+            // the value is a percent 0–100 and may be omitted, leaving the
+            // consumer's standing value unchanged. Only exactly a state in 0–4
+            // and an optional value in 0–100 is consumed; every other payload
+            // falls through to `unhandled`.
+            b"9" if params.len() >= 3 && params.len() <= 4 && params[1] == b"4" => {
+                let state = match parse_number(params[2]).filter(|&state| state <= 4) {
+                    Some(state) => state,
+                    None => return unhandled(params),
+                };
+                let value = match params.get(3) {
+                    None => None,
+                    Some(raw) => match parse_number(raw).filter(|&value| value <= 100) {
+                        Some(value) => Some(value),
+                        None => return unhandled(params),
+                    },
+                };
+                self.handler.progress_report(state, value);
+            },
+
             _ => unhandled(params),
         }
     }
@@ -2083,6 +2113,7 @@ mod tests {
         reset_colors: Vec<usize>,
         prompt_exit: Option<u32>,
         current_directory: Option<String>,
+        progress_report: Option<(u8, Option<u8>)>,
     }
 
     impl Handler for MockHandler {
@@ -2119,6 +2150,10 @@ mod tests {
             self.current_directory = Some(url);
         }
 
+        fn progress_report(&mut self, state: u8, value: Option<u8>) {
+            self.progress_report = Some((state, value));
+        }
+
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
@@ -2135,6 +2170,7 @@ mod tests {
                 reset_colors: Vec::new(),
                 prompt_exit: None,
                 current_directory: None,
+                progress_report: None,
             }
         }
     }
@@ -2434,6 +2470,102 @@ mod tests {
         parser.advance(&mut handler, bytes);
 
         assert_eq!(handler.current_directory, None);
+    }
+
+    #[test]
+    fn parse_osc94_progress_state_and_value() {
+        let bytes: &[u8] = b"\x1b]9;4;1;42\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, Some((1, Some(42))));
+    }
+
+    #[test]
+    fn parse_osc94_progress_state_only_st_terminated() {
+        let bytes: &[u8] = b"\x1b]9;4;3\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, Some((3, None)));
+    }
+
+    #[test]
+    fn parse_osc94_progress_remove_state() {
+        let bytes: &[u8] = b"\x1b]9;4;0\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, Some((0, None)));
+    }
+
+    #[test]
+    fn parse_osc94_progress_max_value() {
+        let bytes: &[u8] = b"\x1b]9;4;1;100\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, Some((1, Some(100))));
+    }
+
+    #[test]
+    fn parse_osc94_progress_state_out_of_range_unhandled() {
+        let bytes: &[u8] = b"\x1b]9;4;5\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, None);
+    }
+
+    #[test]
+    fn parse_osc94_progress_value_out_of_range_unhandled() {
+        let bytes: &[u8] = b"\x1b]9;4;1;101\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, None);
+    }
+
+    #[test]
+    fn parse_osc94_progress_non_integer_unhandled() {
+        let bytes: &[u8] = b"\x1b]9;4;x;50\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, None);
+    }
+
+    #[test]
+    fn parse_osc94_bare_unhandled() {
+        let bytes: &[u8] = b"\x1b]9;4\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.progress_report, None);
     }
 
     #[test]
