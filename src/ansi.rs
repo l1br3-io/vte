@@ -509,6 +509,12 @@ pub trait Handler {
     /// standing value should stay unchanged.
     fn progress_report(&mut self, _state: u8, _value: Option<u8>) {}
 
+    /// Program status report (OSC 7501, Hashimoto's Program Status
+    /// Protocol); the body's `key=value[:key=value…]` pairs exactly as
+    /// the emitter wrote them — the key/value grammar and every policy
+    /// stay consumer-side.
+    fn program_status(&mut self, _body: String) {}
+
     /// Set the cursor style.
     fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
 
@@ -1585,6 +1591,26 @@ where
                 self.handler.progress_report(state, value);
             },
 
+            // Program status report (OSC 7501, Hashimoto's Program Status
+            // Protocol); the parameter is the body's key=value pairs.
+            //
+            // libghostty/kitty semantics: a program reports what it is —
+            // the required state (idle|working|done|blocked|error|clear)
+            // with optional progress/kind/app/title/msg/id keys, pairs
+            // joined by `:`. The fork parses only the OSC framing; the
+            // key/value grammar and every policy stay consumer-side, so
+            // the body crosses verbatim (semicolons inside it rejoined,
+            // as the OSC 7 arm does). An empty body falls through to
+            // `unhandled`.
+            b"7501" if params.len() >= 2 && !params[1].is_empty() => {
+                let mut body = String::from_utf8_lossy(params[1]).into_owned();
+                for param in &params[2..] {
+                    body.push(';');
+                    body.push_str(&String::from_utf8_lossy(param));
+                }
+                self.handler.program_status(body);
+            },
+
             _ => unhandled(params),
         }
     }
@@ -2114,6 +2140,7 @@ mod tests {
         prompt_exit: Option<u32>,
         current_directory: Option<String>,
         progress_report: Option<(u8, Option<u8>)>,
+        program_status: Option<String>,
     }
 
     impl Handler for MockHandler {
@@ -2154,6 +2181,10 @@ mod tests {
             self.progress_report = Some((state, value));
         }
 
+        fn program_status(&mut self, body: String) {
+            self.program_status = Some(body);
+        }
+
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
@@ -2171,6 +2202,7 @@ mod tests {
                 prompt_exit: None,
                 current_directory: None,
                 progress_report: None,
+                program_status: None,
             }
         }
     }
@@ -2566,6 +2598,66 @@ mod tests {
         parser.advance(&mut handler, bytes);
 
         assert_eq!(handler.progress_report, None);
+    }
+
+    #[test]
+    fn parse_osc7501_program_status() {
+        let bytes: &[u8] = b"\x1b]7501;state=working:progress=40\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.program_status, Some("state=working:progress=40".to_owned()));
+    }
+
+    #[test]
+    fn parse_osc7501_program_status_st_terminated() {
+        let bytes: &[u8] = b"\x1b]7501;state=blocked\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.program_status, Some("state=blocked".to_owned()));
+    }
+
+    #[test]
+    fn parse_osc7501_semicolon_body_rejoined() {
+        let bytes: &[u8] = b"\x1b]7501;state=working;title=YWJj\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.program_status, Some("state=working;title=YWJj".to_owned()));
+    }
+
+    #[test]
+    fn parse_osc7501_empty_unhandled() {
+        let bytes: &[u8] = b"\x1b]7501;\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.program_status, None);
+    }
+
+    #[test]
+    fn parse_osc7501_bare_unhandled() {
+        let bytes: &[u8] = b"\x1b]7501\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.program_status, None);
     }
 
     #[test]
