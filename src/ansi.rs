@@ -521,6 +521,11 @@ pub trait Handler {
     /// consumer-side.
     fn iterm_inline_image(&mut self, _params: &[&[u8]]) {}
 
+    /// APC string payload (kitty graphics); the accumulated bytes
+    /// exactly as the emitter wrote them, introducer included — the
+    /// protocol check and every policy stay consumer-side.
+    fn apc_payload(&mut self, _payload: &[u8]) {}
+
     /// Set the cursor style.
     fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
 
@@ -1351,6 +1356,11 @@ where
     }
 
     #[inline]
+    fn apc_dispatch(&mut self, payload: &[u8]) {
+        self.handler.apc_payload(payload);
+    }
+
+    #[inline]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
@@ -2162,6 +2172,7 @@ mod tests {
         progress_report: Option<(u8, Option<u8>)>,
         program_status: Option<String>,
         iterm_image: Option<Vec<Vec<u8>>>,
+        apc_payload: Option<Vec<u8>>,
     }
 
     impl Handler for MockHandler {
@@ -2210,6 +2221,10 @@ mod tests {
             self.iterm_image = Some(params.iter().map(|p| p.to_vec()).collect());
         }
 
+        fn apc_payload(&mut self, payload: &[u8]) {
+            self.apc_payload = Some(payload.to_vec());
+        }
+
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
@@ -2229,6 +2244,7 @@ mod tests {
                 progress_report: None,
                 program_status: None,
                 iterm_image: None,
+                apc_payload: None,
             }
         }
     }
@@ -2809,6 +2825,32 @@ mod tests {
         parser.advance(&mut handler, bytes);
 
         assert_eq!(handler.iterm_image, None);
+    }
+
+    #[test]
+    fn parse_apc_payload_forwarded_verbatim() {
+        let bytes: &[u8] = b"\x1b_Ga=q\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.apc_payload, Some(b"Ga=q".to_vec()));
+    }
+
+    #[test]
+    fn parse_apc_payload_without_g_still_forwarded() {
+        // The kitty protocol check is consumer-side; anything else the
+        // shared SOS/PM/APC state carries still arrives.
+        let bytes: &[u8] = b"\x1b_g\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.apc_payload, Some(b"g".to_vec()));
     }
 
     #[test]

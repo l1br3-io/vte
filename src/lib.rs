@@ -44,6 +44,7 @@ pub use params::{Params, ParamsIter};
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
+const MAX_APC_RAW: usize = 8 * 1024;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -64,6 +65,13 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_raw: Vec<u8>,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
+    #[cfg(not(feature = "std"))]
+    apc_raw: ArrayVec<u8, MAX_APC_RAW>,
+    #[cfg(feature = "std")]
+    apc_raw: Vec<u8>,
+    /// Whether the current SOS/PM/APC string blew the accumulation cap
+    /// — an aborted string dispatches nothing.
+    apc_oversize: bool,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
@@ -179,7 +187,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
-            State::SosPmApcString => self.anywhere(performer, byte),
+            State::SosPmApcString => self.advance_sos_pmapc_string(performer, byte),
             State::Ground => unreachable!(),
         }
     }
@@ -356,7 +364,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
             },
-            0x58 => self.state = State::SosPmApcString,
+            0x58 => {
+                self.apc_start();
+                self.state = State::SosPmApcString
+            },
             0x59..=0x5A => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -374,7 +385,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E..=0x5F => {
+                self.apc_start();
+                self.state = State::SosPmApcString
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -447,6 +461,58 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             },
             _ => (),
         }
+    }
+
+    /// Begin an SOS/PM/APC string: the introducer is not distinguished
+    /// (the three share the state), and whatever a previous string left
+    /// in the buffer is dropped here.
+    #[inline]
+    fn apc_start(&mut self) {
+        self.apc_raw.clear();
+        self.apc_oversize = false;
+    }
+
+    /// Advance inside an SOS/PM/APC string: payload bytes accumulate,
+    /// other C0 controls pass by, and the terminators end the string —
+    /// dispatching its accumulated payload — before their usual
+    /// anywhere handling.
+    #[inline(always)]
+    fn advance_sos_pmapc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => (),
+            0x18 | 0x1A => {
+                self.apc_end(performer);
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+            0x1B => {
+                self.apc_end(performer);
+                self.reset_params();
+                self.state = State::Escape
+            },
+            _ => self.action_apc_put(byte),
+        }
+    }
+
+    /// Accumulate one SOS/PM/APC payload byte; a string past the cap
+    /// aborts silently — well-formed kitty chunks are ≤4 KiB base64,
+    /// so a longer string is hostile or corrupt.
+    #[inline(always)]
+    fn action_apc_put(&mut self, byte: u8) {
+        if self.apc_raw.len() >= MAX_APC_RAW {
+            self.apc_oversize = true;
+            return;
+        }
+        self.apc_raw.push(byte);
+    }
+
+    /// End the SOS/PM/APC string: dispatch the accumulated payload —
+    /// unless the cap aborted it — then drop the buffer.
+    fn apc_end<P: Perform>(&mut self, performer: &mut P) {
+        if !self.apc_oversize {
+            performer.apc_dispatch(&self.apc_raw);
+        }
+        self.apc_start();
     }
 
     #[inline]
@@ -791,6 +857,15 @@ pub trait Perform {
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
+    /// Dispatch an APC string's accumulated payload.
+    ///
+    /// The payload is everything between the string's introducer
+    /// (`ESC _`, `ESC ^`, or `ESC X` — the state is shared, the
+    /// introducer not distinguished) and its terminator (ST, CAN, SUB,
+    /// or a bare ESC). Bytes over the parser's accumulation cap abort
+    /// the string silently — no dispatch fires.
+    fn apc_dispatch(&mut self, _payload: &[u8]) {}
+
     /// A final character has arrived for a CSI sequence
     ///
     /// The `ignore` flag indicates that either more than two intermediates
@@ -857,6 +932,7 @@ mod tests {
         Print(char),
         Execute(u8),
         DcsUnhook,
+        Apc(Vec<u8>),
     }
 
     impl Perform for Dispatcher {
@@ -896,6 +972,10 @@ mod tests {
 
         fn execute(&mut self, byte: u8) {
             self.dispatched.push(Sequence::Execute(byte));
+        }
+
+        fn apc_dispatch(&mut self, payload: &[u8]) {
+            self.dispatched.push(Sequence::Apc(payload.to_vec()));
         }
     }
 
@@ -1538,5 +1618,161 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 2);
         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0x18));
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
+    }
+
+    #[test]
+    fn apc_st_terminated_accumulates_payload() {
+        const INPUT: &[u8] = b"\x1b_Ga=T,f=32,s=2,v=1,m=1;AAAA\x1b\\";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        // The ST's final byte is its own esc_dispatch, as for OSC.
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Ga=T,f=32,s=2,v=1,m=1;AAAA".to_vec()));
+        assert_eq!(dispatcher.dispatched[1], Sequence::Esc(Vec::new(), false, b'\\'));
+    }
+
+    #[test]
+    fn apc_chunked_across_advance_calls() {
+        const INPUT: &[u8] = b"\x1b_Ga=T,m=1;QUJD\x1b\\";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, &INPUT[..6]);
+        parser.advance(&mut dispatcher, &INPUT[6..12]);
+        parser.advance(&mut dispatcher, &INPUT[12..]);
+
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Ga=T,m=1;QUJD".to_vec()));
+        assert_eq!(dispatcher.dispatched[1], Sequence::Esc(Vec::new(), false, b'\\'));
+    }
+
+    #[test]
+    fn apc_can_terminated() {
+        const INPUT: &[u8] = b"\x1b_Ghello\x18";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Ghello".to_vec()));
+        assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x18));
+    }
+
+    #[test]
+    fn apc_sub_terminated() {
+        const INPUT: &[u8] = b"\x1b_Ghello\x1a";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Ghello".to_vec()));
+        assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
+    }
+
+    #[test]
+    fn apc_bare_esc_dispatches_and_next_sequence_parses() {
+        const INPUT: &[u8] = b"\x1b_Gq=1\x1b[2J";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Gq=1".to_vec()));
+        assert!(matches!(dispatcher.dispatched[1], Sequence::Csi(..)));
+    }
+
+    #[test]
+    fn apc_empty_string_dispatches_empty() {
+        const INPUT: &[u8] = b"\x1b_\x1b\\";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(Vec::new()));
+        assert_eq!(dispatcher.dispatched[1], Sequence::Esc(Vec::new(), false, b'\\'));
+    }
+
+    #[test]
+    fn apc_over_cap_aborts_silently() {
+        let mut input = vec![0x1B, b'_'];
+        input.extend(std::iter::repeat_n(b'A', MAX_APC_RAW + 1));
+        input.extend_from_slice(b"\x1b\\");
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, &input);
+
+        assert!(!dispatcher
+            .dispatched
+            .iter()
+            .any(|sequence| matches!(sequence, Sequence::Apc(..))));
+    }
+
+    #[test]
+    fn apc_at_cap_dispatches() {
+        let mut input = vec![0x1B, b'_'];
+        input.extend(std::iter::repeat_n(b'A', MAX_APC_RAW));
+        input.extend_from_slice(b"\x1b\\");
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, &input);
+
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        match &dispatcher.dispatched[0] {
+            Sequence::Apc(payload) => assert_eq!(payload.len(), MAX_APC_RAW),
+            _ => panic!("expected apc sequence"),
+        }
+    }
+
+    #[test]
+    fn sos_and_pm_strings_share_the_apc_state() {
+        const SOS_INPUT: &[u8] = b"\x1bXhello\x1b\\";
+        const PM_INPUT: &[u8] = b"\x1b^hello\x1b\\";
+
+        for input in [SOS_INPUT, PM_INPUT] {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, input);
+
+            assert_eq!(dispatcher.dispatched.len(), 2);
+            assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"hello".to_vec()));
+        }
+    }
+
+    #[test]
+    fn apc_after_aborted_string_dispatches() {
+        const INPUT: &[u8] = b"\x1b_Gfirst\x18\x1b_Gsecond\x1b\\";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        // The aborted first string still dispatched (its payload is the
+        // consumer's to validate); the second is unaffected by it.
+        assert_eq!(dispatcher.dispatched.len(), 4);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Gfirst".to_vec()));
+        assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x18));
+        assert_eq!(dispatcher.dispatched[2], Sequence::Apc(b"Gsecond".to_vec()));
+        assert_eq!(dispatcher.dispatched[3], Sequence::Esc(Vec::new(), false, b'\\'));
     }
 }
