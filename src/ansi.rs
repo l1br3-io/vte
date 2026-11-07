@@ -515,6 +515,12 @@ pub trait Handler {
     /// stay consumer-side.
     fn program_status(&mut self, _body: String) {}
 
+    /// Inline image (OSC 1337, iTerm2); the raw semicolon-split
+    /// parameter slices of the sequence body exactly as the emitter
+    /// wrote them — the argument grammar and every policy stay
+    /// consumer-side.
+    fn iterm_inline_image(&mut self, _params: &[&[u8]]) {}
+
     /// Set the cursor style.
     fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
 
@@ -1611,6 +1617,20 @@ where
                 self.handler.program_status(body);
             },
 
+            // Inline image (OSC 1337, iTerm2); the parameters are the raw
+            // semicolon-split slices of the sequence body.
+            //
+            // iTerm2/wezterm/imgcat semantics: a `File=` single-shot image
+            // or the chunked `MultipartFile`/`FilePart`/`FileEnd` session.
+            // The fork parses only the OSC framing; the argument grammar
+            // (`key=value` pairs, the `:` payload separator, base64) and
+            // every policy stay consumer-side, so the slices cross
+            // verbatim. A body-less or empty-bodied sequence falls through
+            // to `unhandled`.
+            b"1337" if params.len() >= 2 && !params[1].is_empty() => {
+                self.handler.iterm_inline_image(&params[1..]);
+            },
+
             _ => unhandled(params),
         }
     }
@@ -2141,6 +2161,7 @@ mod tests {
         current_directory: Option<String>,
         progress_report: Option<(u8, Option<u8>)>,
         program_status: Option<String>,
+        iterm_image: Option<Vec<Vec<u8>>>,
     }
 
     impl Handler for MockHandler {
@@ -2185,6 +2206,10 @@ mod tests {
             self.program_status = Some(body);
         }
 
+        fn iterm_inline_image(&mut self, params: &[&[u8]]) {
+            self.iterm_image = Some(params.iter().map(|p| p.to_vec()).collect());
+        }
+
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
@@ -2203,6 +2228,7 @@ mod tests {
                 current_directory: None,
                 progress_report: None,
                 program_status: None,
+                iterm_image: None,
             }
         }
     }
@@ -2682,6 +2708,107 @@ mod tests {
         parser.advance(&mut handler, bytes);
 
         assert_eq!(handler.prompt_exit, None);
+    }
+
+    #[test]
+    fn parse_osc1337_legacy_file() {
+        let bytes: &[u8] = b"\x1b]1337;File=inline=1;size=4;name=aGVsbG8:aGVsbG8=\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(
+            handler.iterm_image,
+            Some(vec![
+                b"File=inline=1".to_vec(),
+                b"size=4".to_vec(),
+                b"name=aGVsbG8:aGVsbG8=".to_vec(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_osc1337_legacy_file_st_terminated() {
+        let bytes: &[u8] = b"\x1b]1337;File=inline=1;size=4;name=aGVsbG8:aGVsbG8=\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(
+            handler.iterm_image,
+            Some(vec![
+                b"File=inline=1".to_vec(),
+                b"size=4".to_vec(),
+                b"name=aGVsbG8:aGVsbG8=".to_vec(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_osc1337_multipart_header() {
+        let bytes: &[u8] = b"\x1b]1337;MultipartFile=inline=1;name=aGVsbG8\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(
+            handler.iterm_image,
+            Some(vec![b"MultipartFile=inline=1".to_vec(), b"name=aGVsbG8".to_vec()])
+        );
+    }
+
+    #[test]
+    fn parse_osc1337_file_part() {
+        let bytes: &[u8] = b"\x1b]1337;FilePart=aGVsbG8=\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.iterm_image, Some(vec![b"FilePart=aGVsbG8=".to_vec()]));
+    }
+
+    #[test]
+    fn parse_osc1337_file_end() {
+        let bytes: &[u8] = b"\x1b]1337;FileEnd\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.iterm_image, Some(vec![b"FileEnd".to_vec()]));
+    }
+
+    #[test]
+    fn parse_osc1337_bare_unhandled() {
+        let bytes: &[u8] = b"\x1b]1337\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.iterm_image, None);
+    }
+
+    #[test]
+    fn parse_osc1337_empty_body_unhandled() {
+        let bytes: &[u8] = b"\x1b]1337;\x07";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.iterm_image, None);
     }
 
     #[test]
